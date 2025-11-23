@@ -1,271 +1,321 @@
+# ---------------------------------------------------------
+# NOVA - LLM Enhanced Voice Assistant (Groq Version)
+# (Lightweight version without sentence-transformers)
+# ---------------------------------------------------------
+
+import os
+import sys
+import time
+from datetime import datetime
+
 import pyttsx3
 import speech_recognition as sr
-import wikipedia
 import webbrowser
-import os
-from datetime import datetime
-# imp
-import cv2
-from requests import get
-# import random
 import pywhatkit as pwk
-import sys
 import pyjokes
-import time
-# from bs4 import BeautifulSoup
-# from
-engine = pyttsx3.init('sapi5')
-voices = engine.getProperty('voices')
-# print(voices[1].id)
-engine.setProperty('voices',
-voices[len(voices)-1].id)
-# for voice in voices:
-# print(voice.id)
-# engine.setProperty('voices',voice.id)
-# engine.say("Hello sir")
-# engine.runAndWait()
-def speak(audio):
-    engine.say(audio)
-    print(audio)
-    engine.runAndWait()
-def wishMe():
-    # hour = int(datetime.datetime())
-    hour = datetime.strftime("%H:%M:%S")
-    if hour >=0 and hour <12:
-        speak("Good Morning!")
-    elif hour==12 and hour<18:
-        speak("Good Afternoon!")
-    else:
-        speak("Good Evening")
-    # strTime = datetime.datetime.now().
-tm = ("%H:%M:%S")
-speak(f" Sir its {tm} , i am Mister Nobody, Tell me,how can i help you")
-def takeCommand():
-# it takes microphone input from user and returns string output
+import wikipedia
+import requests
+import json
+
+# ---------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------
+
+# Put your Groq API key in environment variable GROQ_API_KEY or hardcode here (not recommended)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") 
+GROQ_API_URL = "https://api.groq.com/openai/v1"
+
+# Preferred voice index (0 or 1 on your machine). Set to 1 for Zira on Windows.
+VOICE_INDEX = 1
+
+# ---------------------------------------------------------
+# TTS (pyttsx3) helpers
+# ---------------------------------------------------------
+def _init_engine(index: int = VOICE_INDEX):
+    """Create and return a fresh pyttsx3 engine with configured voice and volume."""
+    try:
+        engine_local = pyttsx3.init("sapi5")
+    except Exception:
+        # fallback: try default init
+        engine_local = pyttsx3.init()
+
+    try:
+        voices_local = engine_local.getProperty("voices")
+        chosen = voices_local[index].id if len(voices_local) > index else voices_local[0].id
+        engine_local.setProperty("voice", chosen)
+    except Exception:
+        pass
+    try:
+        engine_local.setProperty("volume", 1.0)
+    except Exception:
+        pass
+    return engine_local
+
+
+def speak(text: str):
+    """
+    Speak reliably by using a fresh TTS engine instance for each utterance.
+    This avoids pyttsx3 getting stuck after microphone use on Windows.
+    """
+    if not text:
+        return
+    print("NOVA:", text)
+    try:
+        engine_local = _init_engine()
+        engine_local.say(text)
+        engine_local.runAndWait()
+        try:
+            engine_local.stop()
+        except Exception:
+            pass
+    except Exception as e:
+        print("TTS error:", e)
+
+
+# ---------------------------------------------------------
+# LIGHTWEIGHT INTENT CLASSIFIER (NO sentence-transformers)
+# ---------------------------------------------------------
+
+INTENT_KEYWORDS = {
+    "open_youtube": ["open youtube", "play youtube", "start youtube"],
+    "open_google": ["open google", "search google", "google search"],
+    "question_answering": ["who is", "what is", "tell me about", "explain", "define"],
+    "summarization": ["summarize", "summarise", "short summary"],
+    "joke": ["tell me a joke", "joke", "make me laugh"],
+    "play_music": ["play music", "play a song", "play on youtube"],
+    "system_control": ["shutdown", "restart", "sleep"],
+}
+
+
+def classify_intent(query: str):
+    q = (query or "").lower()
+
+    # Direct keyword matching
+    for intent, keys in INTENT_KEYWORDS.items():
+        for k in keys:
+            if k in q:
+                return intent
+
+    # Heuristic fallback
+    if any(w in q for w in ["who", "what", "when", "where", "how", "why"]):
+        return "question_answering"
+
+    if "summary" in q or "summarize" in q:
+        return "summarization"
+
+    return "fallback"
+
+
+# ---------------------------------------------------------
+# LLM (GROQ) CHAT COMPLETION — robust & debug-friendly
+# ---------------------------------------------------------
+
+def groq_chat(query,
+              system_prompt="Answer clearly and in a short voice-friendly way.",
+              model="llama-3.1-8b-instant",
+              debug=True):
+    """
+    Call Groq chat/completions endpoint and return the best-guess text.
+    Prints raw response when debug=True for troubleshooting.
+    """
+    if not GROQ_API_KEY  in GROQ_API_KEY:
+        # Friendly early message if key not set
+        return "Groq API key not configured. Set GROQ_API_KEY environment variable."
+
+    try:
+        url = f"{GROQ_API_URL}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+        }
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query},
+            ],
+            "max_tokens": 300,
+            "temperature": 0.6,
+        }
+
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        if debug:
+            print("Groq status:", resp.status_code)
+            print("Groq raw response:", resp.text[:2000])  # print first 2k chars for safety
+
+        # try to parse JSON
+        data = resp.json()
+
+        # 1) OpenAI-like structure: choices -> message -> content
+        if isinstance(data, dict):
+            if "choices" in data and isinstance(data["choices"], list) and len(data["choices"]) > 0:
+                choice = data["choices"][0]
+                # try message.content
+                if isinstance(choice, dict):
+                    msg = choice.get("message") or choice.get("message", {})
+                    if isinstance(msg, dict) and msg.get("content"):
+                        return msg["content"].strip()
+                    # some providers use 'text'
+                    if "text" in choice and isinstance(choice["text"], str):
+                        return choice["text"].strip()
+                # fallback to top-level 'text'
+            # 2) top-level 'text'
+            if "text" in data and isinstance(data["text"], str):
+                return data["text"].strip()
+            # 3) some APIs use 'result'/'output'
+            for k in ("result", "output", "response"):
+                if k in data:
+                    v = data[k]
+                    if isinstance(v, str):
+                        return v.strip()
+                    if isinstance(v, dict) and "content" in v:
+                        return v["content"].strip()
+
+        # final fallback: return truncated raw JSON
+        return "Model returned unexpected response: " + str(data)[:1000]
+
+    except requests.exceptions.RequestException as e:
+        print("Groq network error:", e)
+        return "Network error when contacting Groq."
+    except ValueError as e:
+        print("Groq JSON decode error:", e)
+        return "Invalid response from Groq."
+    except Exception as e:
+        print("Groq generic error:", e)
+        return "Sorry, I couldn't generate a response right now."
+
+
+# ---------------------------------------------------------
+# VOICE PROCESSING
+# ---------------------------------------------------------
+
+def take_command():
     r = sr.Recognizer()
     with sr.Microphone() as source:
         print("Listening...")
+        r.adjust_for_ambient_noise(source, duration=0.7)
         r.pause_threshold = 1
-    # after giving command by user jarvis
-    # will take time of 1 sec to reply
-        audio = r.listen(source, timeout = 5, phrase_time_limit=8)
+
+        try:
+            audio = r.listen(source, timeout=5, phrase_time_limit=8)
+        except Exception as e:
+            print("Listen error:", e)
+            return "None"
+
     try:
         print("Recognizing...")
-        query = r.recognize_google(audio,language = 'en-in')
-        print(f"User said:{query}\n")
+        query = r.recognize_google(audio, language="en-in")
+        print("User said:", query)
+        return query.lower()
     except Exception as e:
-        # print(e)
-            print("Say that again please...")
-            return "None"
-    return query
+        print("Recognize error:", e)
+        return "None"
 
-# def news():
-#     main_url = 'http://newapi.org/v2/topheadlines?'
-#     sources=techcrunch&apikey='84b5bb82621e49b682307f984a8e3282'
-#     main_page=requests.get(main_url).json()
-#     # print)(main_page)
-#     articles = main_page["articles"]
-#     head = []
-#     day = ["first" , "second", "third","fourth","fifth"]
-#     for ar in articles:
-#         head.append(ar["title"])
-#         for i in range(len(day)):
-#             speak(f"today's {day[i]} news is:",{head[i]})
-if __name__ == "__main__":
-# speak("Kedar is Good boy")
-    wishMe()
-    # while True:
-    if 1:
-        query = takeCommand().lower() # type: ignore
-    # logic for excuting task based on query
-        if 'wikipedia' in query:
-            speak('Searching Wikipedia...')
-            query = query.replace("wikipedia","")
-            results = wikipedia.summary(query,
-            sentences=5)
-            speak("According to Wikipedia")
-            print(results)
-            speak(results)
-    #---------------------------->>>>>>>>here nova must give info about user spoken thing
-        elif 'open youtube' in query:
-            webbrowser.open("youtube.com")#-------------...........................................>>>>nova must open youtube
-        elif 'open google' in query:
-            webbrowser.open("google.com")#-------
-            # ------.................
-            # ..........................>>>>nova must
-            # open google
-            speak("Welcome sir...Google is fetching for you")
-            speak("Sir, what should i search on google")
-            cm = takeCommand().lower() # type: ignore
-            webbrowser.open(f"{cm}")
-        elif 'open stackoverflow' in query:
-            webbrowser.open("stackoverflow.com")#-------------..........
-            # .................................>>>>jarvis
-            # must open stackoverflow
-        elif 'open linkedin' in query:
-            webbrowser.open("Linkedin.com")
-            speak("sure")
-        elif 'open geeks for geeks' in query:
-            webbrowser.open("Geeks for Geeks")
-            # elif 'open chat Gpt' in query:
-            # webbrowser.openI("chat.openai.com/auth/login?next=%2F")
-        elif 'how are you' in query:
-            speak("I am fine sir...what about you")
-        elif 'project teacher' in query:
-            speak("Sneha mam")
-            # elif 'largest country in t*he world' in query:
-            # speak("Russia")
-            # print("Russia")
-        elif 'open Notepad' in query:
-            os.startfile("C:\\ProgramData\\Microsoft\\Windows\\StartMenu\\Programs\\Accessories.exe")
-        elif 'activate face recognition system' in query:
-            speak("Face recognition system activated")
-            os.startfile("C:\\Users\\kedar\\OneDrive\\Desktop\\Web development courseCWH\\face_recognition_system.py")
-        elif 'play music' in query:
-            music_dir ='C:\\Users\\kedar\\Music\\Favorite songs'
-            songs = os.listdir(music_dir)
-            print(songs)
-            os.startfile(os.path.join(music_dir,
-            songs[1]))
-            speak("Have a good day Sir...")
-        # elif 'time' in query:
-        #     strTime = datetime.datetime.now().strftime("%H:%M:%S")
-        #     speak(f"Sir , the time is {strTime}")
-            
-        elif 'open code' in query:
-            codePath ="C:\\Users\\kedar\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe"
-            os.startfile(codePath)
-        # elif 'email to kedar' in query:
-        # try:
-        #     speak("What should I say?")
-        #     content = takeCommand()
-        #     to = "kedarmahadik21@gmail.com"
-        #     sendEmail(to , content)
-        #     speak("Email has been sent kedar!")
-        # except Exception as e:
-        #     print(e)
-        #     speak("Sorry sir...I am not able to send this email at the moment")
-        elif 'open calculator' in query:
-            webbrowser.open("calculator")
-        elif 'open facebook' in query:
-            webbrowser.open("Facebook.com")
-            
-        elif 'open command prompt' in query:
-            path1 ="C:\\Users\\kedar\\AppData\\Roaming\\Microsoft\\Windows\\StartMenu\\Programs\\System Tools\\CommandPrompt.lnk"
-            os.startfile(path1)
-            # to close the cmd
-        elif 'close command prompt' in query:
-            speak("ok sir, command promt is closing")
-            os.system("taskkill /f /im Command Prompt.lnk")
-        # elif 'set alarm' in query:
-        #     Al = int(datetime.datetime.now().hour)
-        #     if Al == 16:
-        #         music_dir = 'C:\\Users\\kedar\\Music\\Favorite songs'
-        #     songs = os.listdir(music_dir)
-        #     # print(songs)
-        #     os.startfile(os.path.join(
-        #     music_dir, songs[1]))
-            # ==============================
-            # =====================================
-        elif "tell me a joke" in query:
-            joke = pyjokes.get_joke()
-            speak(joke)
-        elif "shutdown the system" in query:
+
+# ---------------------------------------------------------
+# ACTION HANDLER
+# ---------------------------------------------------------
+
+def handle_intent(intent, query):
+    if intent == "open_youtube":
+        speak("Opening YouTube.")
+        webbrowser.open("https://www.youtube.com")
+
+    elif intent == "open_google":
+        speak("Opening Google.")
+        webbrowser.open("https://www.google.com")
+
+    elif intent == "joke":
+        speak(pyjokes.get_joke())
+
+    elif intent == "play_music":
+        speak("What should I play?")
+        song = take_command()
+        time.sleep(0.12)  # give a tiny pause to allow audio device switch
+        if song not in [None, "None"]:
+            speak(f"Playing {song} on YouTube.")
+            pwk.playonyt(song)
+
+    elif intent == "system_control":
+        if "shutdown" in query:
+            speak("Shutting down system.")
             os.system("shutdown /s /t 5")
-        elif "restart the window" in query:
+        elif "restart" in query:
+            speak("Restarting system.")
             os.system("shutdown /r /t 5")
-        elif "sleep the system" in query:
-            os.system("rundll32.exepowrprof.dll,SetSuspendState 0,1,0")
-            # ==============================
-            # ==============================
-            # ================
-        # elif " switch the window " in query:
-        #     pyautogui.keyDown("alt")
-        #     pyautogui.press("tab")
-        #     time.sleep(1)
-        #     pyautogui.keyUp("alt")
-        elif "email to kedar" in query:
-            pass
-        # elif 'open camera' in query:
-        #     cap = cv2.VideoCapture(0)
-        #     while True:
-        #     ret, img = cap.read()
-        #     cv2.imshow('webcam',img)
-        #     k = cv2.waitKey(50)
-        #     if k == 27:
-        #     break
-        #     cap.release()
-        #     cv2.destroyAllWindows()
-        elif "ip address" in query:
-            ip = get('http://api.ipify.org').text
-            speak(f"your ip address is {ip}")
-            # whatsapp messages sending
-        # elif "send message" in query:
-        #     msg = takeCommand().lower() # type: ignore
-        #     pwk.sendwhatmsg("+917720032922",
-        #     {msg}, 2,2)
-        elif "play on youtube" in query:
-            speak("what should i play")
-            pl = takeCommand().lower() # type: ignore
-            pwk.playonyt(f"{pl}")
-        # elif "send email to kedar" in query:
-        #     speak("sir what should i say")
-        #     query = takeCommand().lower()
-        #     if "send a file"in query:
-        #         yourEmail = takeCommand().lower()
-        #         email = f'{yourEmail}@gmail.com'
-        #         speak("and your password")
-        #     password = f'{yourEmail}'
-        #     speak("to whom i send this
-        #     email")
-        #     send_to_email =
-        #     f'{yourEmail}@gmail.com'
-        #     speak("okay sir,what is the
-        #     subject for this email")
-        #     query2 = takeCommand().lower()
-        #     message = query2
-        #     speak("sir please enter the
-        #     correct path of the file into shell")
-        #     file_loc = input("please enter
-        #     the path")
-        #     speak("please wait sir, i am
-        #     sending email now")
-        #     msg = MIMEMultipart()
-        #     msg['From'] = email
-        #     msg['To'] = send_to_email
-        #     msg['subject'] = subject
-        #     msg.attach(MIMEText(message,
-        #     'plain'))
-        #     # setup attachment
-        #     filename =
-        #     os.path.basename(file_loc)
-        #     attachment = open(file_loc,"rb")
-        #     part =
-        #     MIMEBase('application','octet-stream')
-        #     part.set_payload(attachment.
-        #     read())
-        #     encoders.encode_base64(part)
-        #     part.add_header('Content-
-        #     Disposition',"attachment; filename = %s"
-        #     %filename)
-        #     # attach the attachmentt to the
-        #     MIMEMultipart object
-        #     msg.attach(part)
-        #     server =
-        #     smtplib.SMTP('smtp.gmail.com', 587)
-        #     server.ehlo()
-        #     server.starttls()
-        #     server.login('kedarmahadik21@
-        #     gmail.com' , 'kedar@2121')
-        #     server.sendemail('kedarmahadik
-        #     21.com', to, content)
-        #     server.close()
-        elif "open whatsapp" in query:
-            webbrowser.open("Whatsapp.com")
-        elif "close the system" in query:
-            speak("System is now closing...have a good day sir")
-            sys.exit()
-#         elif "tell me news" in query:
-#             speak("please wait sir,feteching the latest news")
-# news()
-            
+        elif "sleep" in query:
+            speak("Putting system to sleep.")
+            os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
+
+    elif intent == "summarization":
+        speak("Here is the summary.")
+        # call Groq and speak result
+        ans = groq_chat(f"Summarize this: {query}")
+        time.sleep(0.12)
+        speak(ans)
+
+    elif intent == "question_answering":
+        speak("Let me check that.")
+        ans = groq_chat(query)
+        time.sleep(0.12)
+        speak(ans)
+
+    else:
+        # fallback — call LLM
+        ans = groq_chat(query)
+        time.sleep(0.12)
+        speak(ans)
+
+
+# ---------------------------------------------------------
+# GREETING
+# ---------------------------------------------------------
+
+def wish_me():
+    hour = datetime.now().hour
+    if 0 <= hour < 12:
+        speak("Good morning!")
+    elif 12 <= hour < 18:
+        speak("Good afternoon!")
+    else:
+        speak("Good evening!")
+    speak("I am NOVA. How can I help you?")
+
+
+# ---------------------------------------------------------
+# MAIN LOOP
+# ---------------------------------------------------------
+
+if __name__ == "__main__":
+    wish_me()
+    time.sleep(0.5)
+
+    while True:
+        query = take_command()
+        # small pause so audio device can switch back to speaker
+        time.sleep(0.12)
+
+        if query == "None":
+            speak("I didn't catch that. Please repeat.")
+            continue
+
+        if any(x in query for x in ["exit", "quit", "bye", "goodbye"]):
+            speak("Goodbye! Have a great day.")
+            break
+
+        # Wikipedia Shortcut
+        if "wikipedia" in query:
+            speak("Searching Wikipedia...")
+            try:
+                topic = query.replace("wikipedia", "").strip()
+                result = wikipedia.summary(topic, sentences=3)
+                speak("According to Wikipedia:")
+                speak(result)
+            except Exception as e:
+                print("Wiki error:", e)
+                speak("Sorry, I couldn't find anything on Wikipedia.")
+            continue
+
+        intent = classify_intent(query)
+        print("Intent detected:", intent)
+        handle_intent(intent, query)
