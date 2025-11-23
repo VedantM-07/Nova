@@ -1,0 +1,10 @@
+sentence-transformers
+torch
+numpy
+requests
+pyttsx3
+SpeechRecognition
+pywhatkit
+pyjokes
+wikipedia
+pyaudio
